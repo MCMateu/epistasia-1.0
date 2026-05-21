@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.Rhistory
+.ipynb_checkpoints/
+.DS_Store
+epistasia_web/site/
+site/

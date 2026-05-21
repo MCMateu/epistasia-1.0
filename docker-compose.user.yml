@@ -1,0 +1,11 @@
+services:
+  epistasia:
+    image: sanchezlab/epistasia:0.2.1
+    platform: linux/amd64
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./data:/app/data
+      - ./notebooks:/app/notebooks
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
