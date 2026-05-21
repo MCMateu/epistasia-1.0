@@ -4,8 +4,8 @@
 (genotype–phenotype or community–function maps) and quantify epistatic
 interactions across orders.
 
-📘 Documentation: https://MCMateu.github.io/Epistasia/  
-💻 Source code: https://github.com/MCMateu/Epistasia
+📘 Documentation: https://MCMateu.github.io/epistasia-web/  
+💻 Source code: https://github.com/MCMateu/epistasia-1.0
 
 ---
 
@@ -16,13 +16,13 @@ interactions across orders.
 Recommended while the API is still evolving:
 
 ```bash
-pip install "epistasia @ git+https://github.com/MCMateu/Epistasia.git"
+pip install "epistasia @ git+https://github.com/MCMateu/epistasia-1.0.git"
 ```
 
 ### Editable install for development
 
 ```bash
-git clone https://github.com/MCMateu/Epistasia.git
+git clone https://github.com/MCMateu/epistasia-1.0.git
 cd Epistasia
 pip install -e .
 ```
@@ -62,7 +62,7 @@ my-analysis/
 Download the Docker Compose configuration file:
 
 ```bash
-curl -L https://raw.githubusercontent.com/MCMateu/Epistasia/main/docker-compose.user.yml -o docker-compose.user.yml
+curl -L https://raw.githubusercontent.com/MCMateu/epistasia-1.0/main/docker-compose.user.yml -o docker-compose.user.yml
 ```
 
 Start Epistasia:
