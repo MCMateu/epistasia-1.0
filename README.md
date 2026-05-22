@@ -23,7 +23,7 @@ pip install "epistasia @ git+https://github.com/MCMateu/epistasia-1.0.git"
 
 ```bash
 git clone https://github.com/MCMateu/epistasia-1.0.git
-cd Epistasia
+cd epistasia-1.0
 pip install -e .
 ```
 
@@ -64,6 +64,8 @@ Download the Docker Compose configuration file:
 ```bash
 curl -L https://raw.githubusercontent.com/MCMateu/epistasia-1.0/main/docker-compose.user.yml -o docker-compose.user.yml
 ```
+
+This will use the image [`sanchezlab/epistasia-1.0`](https://hub.docker.com/r/sanchezlab/epistasia-1.0) from Docker Hub.
 
 Start Epistasia:
 
