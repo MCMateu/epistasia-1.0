@@ -1,11 +1,10 @@
 services:
   epistasia:
     build: .
-    image: sanchezlab/epistasia:0.1.0
+    image: sanchezlab/epistasia-1.0:latest
     ports:
       - "8888:8888"
     volumes:
-      - ./epistasia_web/docs/notebooks:/app/notebooks
       - ./data:/app/data
     environment:
       - JUPYTER_ENABLE_LAB=yes
