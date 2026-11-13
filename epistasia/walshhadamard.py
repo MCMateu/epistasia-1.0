@@ -1520,10 +1520,10 @@ def variance_by_order_statistics(
             if as_fraction:
                 tot_b = V_b.sum()
                 if tot_b > 0:
-                    # normalize by observed total_var to keep statistics comparable
-                    Q_b = V_b / total_var
+                    # normalize by the total variance of each bootstrap sample
+                    Q_b = V_b / tot_b
                 else:
-                    Q_b = np.zeros_like(V_b)  # avoid NaNs
+                    Q_b = np.full_like(V_b, np.nan)
             else:
                 Q_b = V_b
 
@@ -1568,9 +1568,9 @@ def variance_by_order_statistics(
                 if as_fraction:
                     tot_i = V_i.sum()
                     if tot_i > 0:
-                        Q_i = V_i / total_var
+                        Q_i = V_i / tot_i
                     else:
-                        Q_i = np.zeros_like(V_i)
+                        Q_i = np.full_like(V_i, np.nan)
                 else:
                     Q_i = V_i
                 Q_jack[i, :] = Q_i
@@ -1653,10 +1653,10 @@ def variance_by_order_statistics(
             if as_fraction:
                 tot_b = V_b.sum()
                 if tot_b > 0:
-                    # normalize by observed total_var to keep statistics comparable
-                    Q_b = V_b / total_var
+                    # normalize by the total variance of each bootstrap sample
+                    Q_b = V_b / tot_b
                 else:
-                    Q_b = np.zeros_like(V_b)
+                    Q_b = np.full_like(V_b, np.nan)
             else:
                 Q_b = V_b
 
