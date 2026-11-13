@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import numpy as np
 from typing import Optional, Tuple, Iterable, Sequence, Dict, Any, Union,  Literal
 import pandas as pd
+import warnings
 
 from matplotlib.colors import LinearSegmentedColormap
 
@@ -32,7 +33,40 @@ from collections import namedtuple
 
 from .stats_noise.noise_models import bootstrap_uncertainty, bootstrap_null
 
-MissingPolicy = Literal["error", "drop"]
+##################################################################
+#                            POLICIES                            #
+##################################################################
+
+from .policies import (
+    NanPolicy,
+    MissingPolicy,
+    normalize_nan_policy as _normalize_nan_policy,
+    normalize_missing_policy as _normalize_missing_policy,
+    as_2d_values as _as_2d_values,
+    nanmean_rows as _nanmean_rows,
+)
+
+
+def _disable_bootstrap_without_replicates(
+    R: int,
+    B_uncertainty: int,
+    B_null: int,
+    *,
+    context: str,
+) -> tuple[int, int, bool]:
+    """Disable bootstrap requests when fewer than two replicate columns exist."""
+    skip = R < 2 and (B_uncertainty > 0 or B_null > 0)
+    if skip:
+        warnings.warn(
+            f"{context}: bootstrap procedures require at least two replicate "
+            "columns. Returning point estimates and NaN bootstrap/null "
+            "summaries instead.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return 0, 0, True
+    return B_uncertainty, B_null, False
+
 
 ##################################################################
 #                      EPISTASIS DATACLASS                       #
@@ -50,18 +84,24 @@ class Epistasis:
     Attributes
     ----------
     values : np.ndarray
-        Array of shape (M', R) with replicate-level epistatic values.
-        Each row corresponds to a background configuration; each column to a replicate.
+        Array containing replicate-level contrasts when these are meaningful. For
+        nan_policy="nanmean", the main estimator in `mean` is computed from
+        state-level nanmeans, while `values` stores paired replicate-level
+        contrasts used only to estimate experimental/biological SDs.
     mean : np.ndarray
-        Array of shape (M',) with the mean epistatic effect across replicates
-        for each background.
+        Array of shape (M',) with the estimated epistatic effect for each
+        background. Under nan_policy="nanmean", this is computed as an
+        alternating contrast of state-level replicate means, not as the mean of
+        `values`.
     std_experimental : np.ndarray
-        Array of shape (M',) containing the standard deviation across replicates
-        (experimental variability) for each background.
+        Array of shape (M',) containing the standard deviation across valid
+        replicate-level contrasts. Entries are NaN when fewer than two valid
+        replicate-level contrasts are available.
     std_biological : np.ndarray
-        Array of shape (M',) with the standard deviation of the mean estimator,
-        i.e. std_experimental / sqrt(R). This reflects the uncertainty of the
-        inferred biological effect for each background.
+        Array of shape (M',) containing the standard error of the effect
+        estimate based on valid replicate-level contrasts, i.e.
+        std_experimental / sqrt(n_valid_contrasts). Bootstrap uncertainty is
+        reported separately through confidence intervals and metadata.
     order : int
         Epistasis order (k), i.e. the size of the interacting locus set.
     indices : Tuple[int, ...]
@@ -416,6 +456,47 @@ def _states_for_backgrounds(N: int, fixed_idx: Sequence[int]) -> np.ndarray:
     return X
 
 
+def _summarize_replicate_contrasts(
+    contrast_rep: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Summarize replicate-level contrasts.
+
+    Parameters
+    ----------
+    contrast_rep
+        Array of shape (M', R) containing replicate-level contrasts.
+        NaNs mean that the contrast could not be computed for that replicate.
+
+    Returns
+    -------
+    mean_rep
+        Mean of replicate-level contrasts, ignoring NaNs.
+        This is diagnostic; it does not need to be used as the main estimator.
+    std_exp
+        Experimental standard deviation across valid replicate-level contrasts.
+    std_bio
+        Standard error of the mean contrast: std_exp / sqrt(n_valid).
+    n_valid
+        Number of valid replicate-level contrasts per background.
+    """
+    contrast_rep = _as_2d_values(contrast_rep)
+
+    n_valid = np.sum(np.isfinite(contrast_rep), axis=1)
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean_rep = np.nanmean(contrast_rep, axis=1)
+        std_exp = np.nanstd(contrast_rep, axis=1, ddof=1)
+
+    std_exp[n_valid < 2] = np.nan
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        std_bio = std_exp / np.sqrt(n_valid)
+
+    std_bio[n_valid < 2] = np.nan
+
+    return mean_rep, std_exp, std_bio, n_valid
+
 #######################################################################
 #                            SYMMBOLIC                                #
 #######################################################################
@@ -569,8 +650,8 @@ def focal_effect(
     L: "Landscape",
     i: int,
     *,
-    missing_policy: str = "error",
-    nan_policy: str = "omit",
+    missing_policy: str = "drop",
+    nan_policy: str = "nanmean",
     B_uncertainty: int = 0,
     uncertainty_flavor: str = "iid",
     B_null: int = 0,
@@ -586,20 +667,26 @@ def focal_effect(
         raise TypeError("L must provide .states and .values.")
     if not (0 <= i < L.N):
         raise ValueError(f"Invalid focal index: {i}")
-    if missing_policy not in {"error", "drop"}:
-        raise ValueError("missing_policy must be 'error' or 'drop'")
-    if nan_policy not in {"omit", "propagate"}:
-        raise ValueError("nan_policy must be 'omit' or 'propagate'")
+
+
+    missing_policy = _normalize_missing_policy(missing_policy)
+    nan_policy = _normalize_nan_policy(nan_policy)
+
     if rng is None:
         rng = np.random.default_rng()
 
     states = L.states.astype(int, copy=False)
-    values = L.values
+    values = _as_2d_values(L.values)
+
     M, N = states.shape
     R = values.shape[1]
 
-    if R < 2 and (B_uncertainty > 0 or B_null > 0):
-        raise ValueError("At least 2 replicates required for bootstrap.")
+    B_uncertainty, B_null, bootstrap_skipped_no_replicates = _disable_bootstrap_without_replicates(
+        R,
+        B_uncertainty,
+        B_null,
+        context="focal_effect",
+    )
 
     # ----- Pair backgrounds (xi=1 vs xi=0) -----
     backgrounds, abs_idx0, abs_idx1, bg_key = _pair_focal_backgrounds(
@@ -612,37 +699,35 @@ def focal_effect(
     F0 = values[abs_idx0]
 
 
-    # ----- Compute delta = F1 - F0 -----
-    if nan_policy == "omit":
-        # Estimate each state's value using all available replicates,
-        # then compute the focal effect.
-        F1_mean = np.nanmean(F1, axis=1)
-        F0_mean = np.nanmean(F0, axis=1)
-
+    if nan_policy == "nanmean":
+        # Main estimator: estimate each state's biological value from available replicates.
+        F1_mean = _nanmean_rows(F1)
+        F0_mean = _nanmean_rows(F0)
         mean = F1_mean - F0_mean
 
-        # Store as (M', 1): one coherent point estimate per background.
-        delta = mean[:, None]
+        # Auxiliary replicate-level contrasts, used only for experimental/biological SD.
+        # These are valid only for replicate columns available in both states.
+        delta_rep = F1 - F0
+        _, std_exp, std_bio, n_valid_delta = _summarize_replicate_contrasts(delta_rep)
 
-        # Experimental SD is not defined from paired replicate differences here.
-        std_exp = np.full(Mprime, np.nan)
-        std_bio = np.full(Mprime, np.nan)
+        # Store replicate-level contrasts when available. The main estimator remains `mean`.
+        delta = delta_rep
 
     elif nan_policy == "propagate":
-        # Strict paired-replicate difference: NaNs propagate.
+        # Paired-replicate differences; NaNs propagate replicate-wise.
         delta = F1 - F0
+        mean, std_exp, std_bio = _summarize_effect_values(delta, nan_policy=nan_policy)
+        n_valid_delta = np.sum(np.isfinite(delta), axis=1)
 
-        mean = np.nanmean(delta, axis=1)
-        n_valid = np.sum(np.isfinite(delta), axis=1)
-
-        std_exp = np.nanstd(delta, axis=1, ddof=1)
-        std_exp[n_valid < 2] = np.nan
-
-        std_bio = std_exp / np.sqrt(n_valid)
-        std_bio[n_valid < 2] = np.nan
+    elif nan_policy == "error":
+        if np.isnan(F0).any() or np.isnan(F1).any():
+            raise ValueError("NaNs found in required values for focal_effect with nan_policy='error'.")
+        delta = F1 - F0
+        mean, std_exp, std_bio = _summarize_effect_values(delta, nan_policy=nan_policy)
+        n_valid_delta = np.full(delta.shape[0], delta.shape[1], dtype=int)
 
     else:
-        raise ValueError("nan_policy must be 'omit' or 'propagate'")
+        raise RuntimeError("Internal error: unreachable nan_policy branch.")
 
     indices = (i,)
     indices_names = (L.feature_names[i],)
@@ -662,14 +747,27 @@ def focal_effect(
         background_indices=bg_indices,
         background_names=bg_names,
         meta={
-        "focal_index": i,
-        "missing_policy": missing_policy,
-        "nan_policy": nan_policy,
-        # Required by fees.fee_data() to reconstruct F0/F1 without re-pairing
-        "abs_idx0": abs_idx0,
-        "abs_idx1": abs_idx1,
-        # Optional but useful for debugging/joins
-        "bg_key": bg_key,},
+            "focal_index": i,
+            "missing_policy": missing_policy,
+            "nan_policy": nan_policy,
+            "mean_estimator": (
+                "nanmean(F1_replicates) - nanmean(F0_replicates)"
+                if nan_policy == "nanmean"
+                else "replicate_level_difference"
+            ),
+            "std_estimator": (
+                "replicate_paired_contrasts"
+                if nan_policy == "nanmean"
+                else "strict_replicate_level_difference"
+            ),
+            "n_valid_contrasts": n_valid_delta,
+            "bootstrap_skipped_no_replicates": bootstrap_skipped_no_replicates,
+            # Required by fees.fee_data() to reconstruct F0/F1 without re-pairing
+            "abs_idx0": abs_idx0,
+            "abs_idx1": abs_idx1,
+            # Optional but useful for debugging/joins
+            "bg_key": bg_key,
+        },
     )
 
     # Early exit if no bootstrap
@@ -716,6 +814,7 @@ def focal_effect(
             "multipliers": multipliers,
             "ci_level": ci_level,
             "sign_null_value": 0.0,
+            "std_bootstrap": np.nanstd(delta_b, axis=1, ddof=1).tolist(),
         }
 
     # ============================================================
@@ -794,8 +893,8 @@ def epistasis_k(
     indices: Tuple[int, ...],
     *,
     # Robustness options
-    missing_policy: str = "error",     # {"error","drop"}
-    nan_policy: str = "omit",          # {"omit","propagate"}
+    missing_policy: str = "drop",
+    nan_policy: str = "nanmean",
     # Bootstrap options
     B_uncertainty: int = 0,
     uncertainty_flavor: str = "iid",   # {"iid","wildcluster"}
@@ -827,13 +926,17 @@ def epistasis_k(
         rng = np.random.default_rng()
 
     states = L.states.astype(int, copy=False)
-    values = L.values
+    values = _as_2d_values(L.values)
     M, N = states.shape
     if values.shape[0] != M:
         raise ValueError("States and values must have the same number of rows.")
     R = values.shape[1]
-    if R < 2 and (B_uncertainty > 0 or B_null > 0):
-        raise ValueError("At least 2 replicates are required for bootstrap procedures.")
+    B_uncertainty, B_null, bootstrap_skipped_no_replicates = _disable_bootstrap_without_replicates(
+        R,
+        B_uncertainty,
+        B_null,
+        context="epistasis_k",
+    )
 
     I = tuple(sorted(indices))
     k = len(I)
@@ -841,10 +944,8 @@ def epistasis_k(
         raise ValueError("indices must contain at least one locus.")
     if any(i < 0 or i >= N for i in I):
         raise ValueError(f"indices {I} out of bounds for N={N}.")
-    if missing_policy not in {"error", "drop"}:
-        raise ValueError("missing_policy must be 'error' or 'drop'.")
-    if nan_policy not in {"omit", "propagate"}:
-        raise ValueError("nan_policy must be 'omit' or 'propagate'.")
+    missing_policy = _normalize_missing_policy(missing_policy)
+    nan_policy = _normalize_nan_policy(nan_policy)
 
     # Free loci J = complement of I
     J = tuple(j for j in range(N) if j not in I)
@@ -934,21 +1035,36 @@ def epistasis_k(
     Y = np.stack([values[idx_rows[a_idx]] for a_idx in range(n_patterns)], axis=1)
 
     # ---------- NaN handling before alternating sum ----------
-    if nan_policy == "omit":
-        Y_eff = np.where(np.isnan(Y), 0.0, Y)
-        eps_values = (Y_eff * s[None, :, None]).sum(axis=1)  # (M', R)
-    else:  # "propagate"
-        Y_eff = np.where(np.isnan(Y), 0.0, Y)
-        eps_values = (Y_eff * s[None, :, None]).sum(axis=1)  # (M', R)
-        all_nan_term = np.all(np.isnan(Y), axis=2)           # (M', 2^k)
-        bad_row = np.any(all_nan_term, axis=1)               # (M',)
-        if np.any(bad_row):
-            eps_values[bad_row, :] = np.nan
+    if nan_policy == "nanmean":
+        # Main estimator: mean per required state, then alternating contrast.
+        # Y shape: (M', 2^k, R)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            Y_mean = np.nanmean(Y, axis=2)  # (M', 2^k)
 
-    # ---------- summary statistics ----------
-    mean = np.nanmean(eps_values, axis=1)        # (M',)
-    std_exp = np.nanstd(eps_values, axis=1, ddof=1)
-    std_bio = std_exp / np.sqrt(R)
+        mean = (Y_mean * s[None, :]).sum(axis=1)
+
+        # Replicate-level contrasts for experimental/biological SD.
+        # A replicate-level k-way contrast is valid only if all required terms
+        # are finite for that replicate.
+        eps_rep = (Y * s[None, :, None]).sum(axis=1)  # (M', R), NaNs propagate naturally
+
+        _, std_exp, std_bio, n_valid_eps = _summarize_replicate_contrasts(eps_rep)
+
+        # Store replicate-level contrasts. The main estimator remains `mean`.
+        eps_values = eps_rep
+
+    elif nan_policy == "propagate":
+        eps_values = (Y * s[None, :, None]).sum(axis=1)
+        mean, std_exp, std_bio = _summarize_effect_values(eps_values, nan_policy=nan_policy)
+
+    elif nan_policy == "error":
+        if np.isnan(Y).any():
+            raise ValueError("NaNs found in required values for epistasis_k with nan_policy='error'.")
+        eps_values = (Y * s[None, :, None]).sum(axis=1)
+        mean, std_exp, std_bio = _summarize_effect_values(eps_values, nan_policy=nan_policy)
+
+    else:
+        raise RuntimeError("Internal error: unreachable nan_policy branch.")
 
     # ---------- Epistasis container ----------
     indices_names = tuple(L.feature_names[j] for j in I)
@@ -971,6 +1087,18 @@ def epistasis_k(
             "order": k,
             "missing_policy": missing_policy,
             "nan_policy": nan_policy,
+            "mean_estimator": (
+                "alternating_sum_of_state_nanmeans"
+                if nan_policy == "nanmean"
+                else "replicate_level_alternating_sum"
+            ),
+            "std_estimator": (
+                "replicate_paired_alternating_contrasts"
+                if nan_policy == "nanmean"
+                else "replicate_level_alternating_sum"
+            ),
+            "n_valid_contrasts": n_valid_eps if nan_policy == "nanmean" else None,
+            "bootstrap_skipped_no_replicates": bootstrap_skipped_no_replicates,
         },
     )
 
@@ -1017,6 +1145,7 @@ def epistasis_k(
             "multipliers": multipliers,
             "ci_level": ci_level,
             "sign_null_value": 0.0,
+            "std_bootstrap": np.nanstd(eps_b, axis=1, ddof=1).tolist(),
         }
 
         E.ci_low = ci_low
@@ -1103,47 +1232,84 @@ def epistasis_k_replics(
     N: int,
     idx: Sequence[int],
     *,
-    nan_policy: str = "omit",   # {"omit", "propagate"}
+    nan_policy: str = "nanmean",
 ) -> np.ndarray:
     """
     Compute ε_{i1..ik}(x) across all backgrounds for a full 2^N landscape.
 
     Fast, low-level helper assuming:
-      - states are the full hypercube in MSB-first lexicographic order,
-      - no bootstrap, no null model; just the raw epistasis tensor.
+      - states are the full hypercube in MSB-first lexicographic order;
+      - no bootstrap and no null model are computed here;
+      - missing states are not allowed, because the full hypercube is required.
 
     Parameters
     ----------
     F : array_like of float
         Landscape values in lexicographic order (MSB-first).
         Accepts:
-          - shape (2^N,)   → single landscape
-          - shape (2^N, R) → multiple replicates in columns
+          - shape (2^N,)   -> single landscape;
+          - shape (2^N, R) -> replicate measurements in columns.
+
     N : int
-        Number of loci (so F.shape[0] must equal 2^N).
+        Number of loci. The first dimension of F must be 2^N.
+
     idx : sequence of int
-        Locus indices defining the k-wise term.
-    nan_policy : {"omit", "propagate"}, default="omit"
-        - "omit": treat NaNs as 0 in each term before the alternating sum.
-        - "propagate": if any term (pattern over idx) is entirely NaN across
-          replicates for a given background, the resulting epistasis for that
-          background is set to NaN (otherwise NaNs are treated as 0 in the sum).
+        Locus indices defining the k-way epistatic coefficient.
+
+    nan_policy : {"nanmean", "propagate", "error"}, default="nanmean"
+        Policy for handling NaNs in F.
+
+        - "nanmean":
+            First estimates one value per state by averaging available
+            replicate measurements with np.nanmean. The alternating sum is then
+            computed on these state-level means. The output therefore contains
+            one value per background.
+
+            If F has shape (2^N, R), the output has shape (2^{N-k}, 1)
+            unless the original input was one-dimensional, in which case the
+            output is squeezed to shape (2^{N-k},).
+
+            Rows whose required states are all-NaN for at least one term will
+            produce NaN for the corresponding background.
+
+        - "propagate":
+            Computes replicate-level alternating sums directly from F.
+            NaNs propagate naturally: if any required term is NaN for a given
+            background and replicate, that replicate-level ε is NaN.
+
+        - "error":
+            Raises a ValueError if any NaN is present in F before computing the
+            alternating sums.
+
+        Legacy compatibility:
+            "omit" is accepted elsewhere as an alias of "nanmean" through
+            _normalize_nan_policy, but new code should use "nanmean".
 
     Returns
     -------
     eps : ndarray of float
-        Epistatic values across all backgrounds where these k loci are free.
-        - shape (2^{N-k},)   if input was (2^N,)
-        - shape (2^{N-k}, R) if input was (2^N, R)
+        Epistatic values across all backgrounds where the loci in idx are free.
+
+        - If input F was one-dimensional:
+              shape (2^{N-k},)
+
+        - If input F was two-dimensional and nan_policy="nanmean":
+              shape (2^{N-k}, 1)
+
+        - If input F was two-dimensional and nan_policy in {"propagate", "error"}:
+              shape (2^{N-k}, R)
 
     Notes
     -----
-    - Biological sign convention "present minus absent":
-        ε_I(x) = Σ_{a∈{0,1}^k} (-1)^{k - |a|} F(x_I = a, x_J fixed)
-      where I = idx, J = complement.
-    - This is a low-level routine assuming perfect coverage and ordering;
-      for general / missing / irregular layouts, use `epistasis_k` over a
-      `Landscape` objeto.
+    Biological sign convention "present minus absent":
+
+        ε_I(x) = sum_{a in {0,1}^k} (-1)^{k + |a|} F(x_I = a, x_J fixed),
+
+    where I = idx and J is its complement.
+
+    This is a low-level routine for perfectly ordered full-cube arrays. For
+    irregular landscapes, missing states, metadata, bootstrap uncertainty, or
+    background labels, use epistasis_k over a Landscape object.
     """
     A = np.asarray(F, dtype=float)
     if A.ndim == 1:
@@ -1157,8 +1323,7 @@ def epistasis_k_replics(
     if A.shape[0] != (1 << N):
         raise ValueError(f"First dimension of F must be 2^N, got {A.shape[0]} != {1<<N}.")
 
-    if nan_policy not in {"omit", "propagate"}:
-        raise ValueError("nan_policy must be 'omit' or 'propagate'.")
+    nan_policy = _normalize_nan_policy(nan_policy)
 
     # Validate loci
     idx = np.array(sorted(set(int(i) for i in idx)), dtype=int)
@@ -1184,43 +1349,34 @@ def epistasis_k_replics(
 
     # Prepare output and (opcional) NaN tracking
     R = A.shape[1]
-    out = np.zeros((M, R), dtype=float)
 
-    if nan_policy == "propagate":
-        # all_nan_term[m, a] = True si para el patrón a todos los reps son NaN en ese background
-        # (M, 2^k)
-        from itertools import product
-        all_nan_term = np.zeros((M, 1 << k), dtype=bool)
+    if nan_policy == "nanmean":
+        # Collapse replicates per state first.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            A_eff = np.nanmean(A, axis=1)[:, None]
+        R_eff = 1
 
-        for a_idx, a_bits in enumerate(product([0, 1], repeat=k)):
-            # (-1)^{k - |a|} with |a| = number of ones in a
-            sign = 1.0 if ((k + sum(a_bits)) % 2 == 0) else -1.0
-            offset = np.dot(a_bits, bit_w) if k > 0 else 0
-            idx_vec = base_idx + offset           # shape (M,)
+    elif nan_policy == "propagate":
+        A_eff = A
+        R_eff = R
 
-            vals = A[idx_vec, :]                  # (M, R)
-            # track all-NaN patterns
-            all_nan_term[:, a_idx] = np.all(np.isnan(vals), axis=1)
+    elif nan_policy == "error":
+        if np.isnan(A).any():
+            raise ValueError("NaNs found in F with nan_policy='error'.")
+        A_eff = A
+        R_eff = R
 
-            # replace NaNs by 0 for the sum
-            vals_eff = np.where(np.isnan(vals), 0.0, vals)
-            out += sign * vals_eff
+    else:
+        raise RuntimeError("Internal error: unreachable nan_policy branch.")
 
-        # backgrounds where ANY pattern is all-NaN across reps → whole row NaN
-        bad_row = np.any(all_nan_term, axis=1)
-        if np.any(bad_row):
-            out[bad_row, :] = np.nan
+    out = np.zeros((M, R_eff), dtype=float)
 
-    else:  # nan_policy == "omit"
-        from itertools import product
-        for a_bits in product([0, 1], repeat=k):
-            sign = 1.0 if ((k + sum(a_bits)) % 2 == 0) else -1.0
-            offset = np.dot(a_bits, bit_w) if k > 0 else 0
-            idx_vec = base_idx + offset           # shape (M,)
-
-            vals = A[idx_vec, :]                  # (M, R)
-            vals_eff = np.where(np.isnan(vals), 0.0, vals)
-            out += sign * vals_eff
+    for a_bits in product([0, 1], repeat=k):
+        sign = 1.0 if ((k + sum(a_bits)) % 2 == 0) else -1.0
+        offset = np.dot(a_bits, bit_w) if k > 0 else 0
+        idx_vec = base_idx + offset
+        vals = A_eff[idx_vec, :]
+        out += sign * vals
 
     return out[:, 0] if squeeze_out else out
 
@@ -1235,8 +1391,8 @@ def compute_full_epistasis(
     min_order: int = 1,
     max_order: Optional[int] = None,
     # Robustness options
-    missing_policy: str = "error",
-    nan_policy: str = "omit",
+    missing_policy: str = "drop",
+    nan_policy: str = "nanmean",
     # Bootstrap options
     B_uncertainty: int = 0,
     uncertainty_flavor: str = "iid",   # {"iid","wildcluster"}
@@ -1347,49 +1503,55 @@ def epistasis_distributions_by_order(
     F: np.ndarray,
     N: int,
     *,
-    nan_policy: str = "omit",   # {"omit", "propagate"}
+    nan_policy: str = "nanmean",
 ) -> EpistasisDists:
     """
-    Compute epistasis ε_{i1..iS}(x) for ALL orders S=1..N and ALL subsets,
-    assuming a full 2^N landscape in lexicographic order, and return
-    pooled distributions by order.
+    Compute epistasis distributions by interaction order for a full 2^N landscape.
 
-    This is a fast, low-level helper:
-
-      - No bootstraps, no null model.
-      - Asume hipercubo completo (sin estados ausentes).
-      - Usa la convención biológica "present minus absent".
+    This is a fast, low-level helper for perfectly ordered full-cube arrays. It
+    computes all k-way epistatic contrasts for all subsets of loci and pools the
+    resulting values by order. It does not handle missing states, metadata,
+    bootstrap uncertainty, or null models.
 
     Parameters
     ----------
     F : ndarray
-        - If shape is (2^N,), it is a single landscape in lexicographic order.
-        - If shape is (2^N, R), the last axis indexes R replicates.
-    N : int
-        Number of loci.
+        Landscape values in lexicographic MSB-first order. Accepted shapes:
 
-    nan_policy : {"omit", "propagate"}, default="omit"
-        Passed to `epistasis_k_replics`:
-        - "omit": trata NaNs como 0 en cada término antes de la suma alternante.
-        - "propagate": si algún término (patrón sobre los loci del conjunto)
-          es todo NaN en todos los replicados para un background dado,
-          la ε correspondiente se marca como NaN.
+        - (2^N,)   : one value per state;
+        - (2^N, R) : replicate measurements in columns.
+
+    N : int
+        Number of loci. The first dimension of F must be 2^N.
+
+    nan_policy : {"nanmean", "propagate", "error"}, default="nanmean"
+        Passed to epistasis_k_replics.
+
+        - "nanmean": average available replicates per state first, then compute
+          the alternating contrast.
+        - "propagate": compute replicate-level contrasts and let NaNs propagate
+          replicate-wise.
+        - "error": raise if F contains any NaN.
+
+        The legacy value "omit" is accepted by _normalize_nan_policy as an alias
+        of "nanmean", but new code should use "nanmean" explicitly.
 
     Returns
     -------
     EpistasisDists
-        A namedtuple with two dicts indexed by order S:
-          - pooled[S]        : 1D array with all ε concatenated across subsets,
-                               backgrounds, and replicates. Length =
-                               comb(N,S) * 2^(N-S) * R.
-          - per_replicate[S] : 2D array with shape
-                               (comb(N,S) * 2^(N-S), R). Each column is a replicate.
+        Named tuple with two dictionaries indexed by interaction order S:
+
+        - pooled[S]: 1D array with all values concatenated across subsets,
+          backgrounds, and available output columns.
+        - per_replicate[S]: 2D array of shape
+          (comb(N, S) * 2^(N-S), R_eff), where R_eff is 1 for
+          nan_policy="nanmean" and R for replicate-level policies.
 
     Notes
     -----
-    - El orden interno de los subconjuntos (i1..iS) es el de `itertools.combinations`
-      sobre range(N), es decir, lexicográfico en los índices de loci.
-      Esto no afecta a histogramas ni estadísticas de orden.
+    Biological sign convention "present minus absent":
+
+        ε_I(x) = sum_{a in {0,1}^k} (-1)^{k + |a|} F(x_I = a, x_J fixed).
     """
 
     A = np.asarray(F, dtype=float)
@@ -1403,8 +1565,7 @@ def epistasis_distributions_by_order(
     if M != (1 << N):
         raise ValueError(f"F must have 2^N rows; got {M} != {1<<N}.")
 
-    if nan_policy not in {"omit", "propagate"}:
-        raise ValueError("nan_policy must be 'omit' or 'propagate'.")
+    nan_policy = _normalize_nan_policy(nan_policy)
 
     pooled: dict[int, np.ndarray] = {}
     per_rep: dict[int, np.ndarray] = {}

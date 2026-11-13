@@ -8,6 +8,7 @@ import numpy as np
 from math import comb
 import pandas as pd
 import matplotlib.pyplot as plt
+import warnings
 
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -17,6 +18,19 @@ from .stats_noise.noise_models import bootstrap_uncertainty, bootstrap_null
 
 if TYPE_CHECKING:
     from .core import Landscape  # only for typing, no runtime import
+
+##################################################################
+#                            POLICIES                            #
+##################################################################
+
+from .policies import (
+    NanPolicy,
+    MissingPolicy,
+    normalize_nan_policy as _normalize_nan_policy,
+    normalize_missing_policy as _normalize_missing_policy,
+    as_2d_values as _as_2d_values,
+    nanmean_rows as _nanmean_rows,
+)
 
 #############################################################
 #                                                           #
@@ -280,104 +294,151 @@ class EpistasisAmplitudeResults:
 def _clean_landscape_for_wh(
     L: "Landscape",
     *,
-    missing_policy: str = "error",
-    nan_policy: str = "omit",
-) -> tuple[np.ndarray, np.ndarray, int]:
+    missing_policy: str = "drop",
+    nan_policy: str = "nanmean",
+) -> tuple[np.ndarray, np.ndarray, int, dict[str, Any]]:
     """
-    Prepare a Landscape object for Walsh–Hadamard analysis by handling
-    missing states and NaN values in replicate measurements.
+    Prepare a Landscape object for Walsh-Hadamard analysis using the common
+    robustness policies.
 
     Parameters
     ----------
     L : Landscape
-        Landscape object with attributes:
-            - states : (M, N) binary array
-            - values : (M, R) float array (replicates allowed to contain NaN)
+        Object with `.states` of shape (M, N) and `.values` of shape (M, R)
+        or (M,). Replicate values may contain NaNs.
 
-    missing_policy : {"error", "drop"}, default="error"
-        Policy for handling structurally missing states (e.g., incomplete
-        hypercube). Currently:
-            - "error": raise if structure is inconsistent
-            - "drop": drop invalid rows (if implemented upstream)
+    missing_policy : {"error", "drop"}, default="drop"
+        Policy for structurally missing states after NaN handling.
 
-    nan_policy : {"omit", "propagate", "nanmean"}, default="omit"
-        Strategy for handling NaNs in replicate measurements:
+        - "error": require a complete 2^N hypercube. If the landscape is
+          incomplete, raise ValueError.
+        - "drop": keep the available states. If the landscape is incomplete,
+          downstream WH coefficients are obtained by empirical projection on
+          the observed subset, not by an exact orthonormal WH transform.
 
-        - "omit":
-            Drop any state (row) that contains at least one NaN across
-            its replicates. This is complete-case filtering.
+    nan_policy : {"nanmean", "propagate", "error"}, default="nanmean"
+        Policy for NaNs in replicate measurements.
 
-        - "propagate":
-            Keep NaNs unchanged. Downstream routines must be able to
-            handle NaN values. No filtering is performed.
+        - "nanmean": keep states with at least one valid replicate. The point
+          estimate is later computed from np.nanmean over replicates, while the
+          original replicate matrix is preserved for bootstrap procedures.
+        - "propagate": keep NaNs in the replicate matrix. Point estimates use a
+          standard mean, so NaNs propagate.
+        - "error": raise if any NaN is present.
 
-        - "nanmean":
-            Collapse replicates into a single pseudo-replicate using
-            np.nanmean across replicates for each state:
-                F_mean(x) = nanmean_r F(x, r)
-            States with at least one valid replicate are kept.
-            States with all replicates NaN are dropped.
-
-            This policy is recommended when replicates represent
-            experimental noise and the Walsh transform should be
-            applied to the underlying biological landscape F(x).
+        Legacy compatibility: "omit" is accepted as an alias of "nanmean" by
+        _normalize_nan_policy, but new code should use "nanmean".
 
     Returns
     -------
-    values : np.ndarray
-        Cleaned array of shape (M_clean, R_clean).
-        If nan_policy="nanmean", then R_clean = 1.
-
-    states : np.ndarray
-        Corresponding binary states of shape (M_clean, N).
-
+    values : ndarray, shape (M_clean, R)
+        Replicate matrix after policy-based row filtering. For nan_policy="nanmean",
+        the replicate columns are not collapsed here so bootstrap routines can
+        still use the available observations.
+    states : ndarray, shape (M_clean, N)
+        Binary states aligned with `values`.
     N : int
-        Number of loci (dimensionality of the binary space).
-
-    Notes
-    -----
-    - The Walsh–Hadamard transform assumes a coherent set of states.
-    - Using nan_policy="omit" may reduce coverage if replicate
-      measurements are uneven.
-    - Using nan_policy="nanmean" preserves states with partial
-      replicate coverage and is typically more appropriate when
-      replicates represent measurement noise rather than biological
-      heterogeneity.
+        Number of loci.
+    meta : dict
+        Cleaning metadata, including whether the retained state set is complete.
     """
+    missing_policy = _normalize_missing_policy(missing_policy)
+    nan_policy = _normalize_nan_policy(nan_policy)
 
-    values = np.asarray(L.values)   # (M,) or (M,R)
-    states = np.asarray(L.states)   # (M,N) in {0,1}
-    if values.ndim == 1:
-        values = values[:, None]    # (M,1)
+    values = _as_2d_values(np.asarray(L.values, dtype=float))
+    states = np.asarray(L.states, dtype=int)
 
+    if states.ndim != 2:
+        raise ValueError("states must be a 2D array of shape (M, N).")
     if states.shape[0] != values.shape[0]:
         raise ValueError("states and values must have matching first dimension.")
 
-    # NaN handling
-    if nan_policy == "omit":
-        mask = np.isfinite(values).any(axis=1)
-        values = values[mask]
-        states = states[mask]
-    elif nan_policy == "propagate":
-        pass
-    elif nan_policy == "nanmean":
-        # Collapse replicates -> single pseudo-replicate
-        vmean = np.nanmean(values, axis=1)     # (M,)
-        values = vmean[:, None]               # (M,1)
+    N = int(states.shape[1])
+    original_M = int(states.shape[0])
 
-        # Drop only states that are all-NaN
-        mask = np.isfinite(values[:, 0])
-        values = values[mask]
-        states = states[mask]
-    else:
-        raise ValueError(f"Unknown nan_policy={nan_policy!r}")
+    if nan_policy == "error" and np.isnan(values).any():
+        raise ValueError("NaNs found with nan_policy='error'.")
 
-    # Missing policy hook (you can extend this)
-    if missing_policy not in {"error", "drop"}:
-        raise ValueError(f"Unknown missing_policy={missing_policy!r}")
+    # With nanmean, a state with all replicates missing has no estimable value.
+    # Treat it as unavailable: drop it when missing_policy='drop', reject it when
+    # missing_policy='error'.
+    all_nan_rows = np.all(~np.isfinite(values), axis=1)
+    dropped_all_nan = int(np.sum(all_nan_rows))
+    if nan_policy == "nanmean" and dropped_all_nan > 0:
+        if missing_policy == "error":
+            raise ValueError(
+                "Some states have no valid replicates under nan_policy='nanmean'. "
+                "Use missing_policy='drop' to discard them."
+            )
+        keep = ~all_nan_rows
+        values = values[keep]
+        states = states[keep]
 
-    N = states.shape[1]
-    return values, states, N
+    complete = _is_full_hypercube(states, N)
+    if missing_policy == "error" and not complete:
+        raise ValueError(
+            "Walsh-Hadamard analysis with missing_policy='error' requires a complete "
+            "2^N hypercube after NaN handling. Use missing_policy='drop' for empirical projection."
+        )
+
+    meta = {
+        "original_M": original_M,
+        "retained_M": int(states.shape[0]),
+        "dropped_all_nan_states": dropped_all_nan,
+        "complete_hypercube": bool(complete),
+        "missing_policy": missing_policy,
+        "nan_policy": nan_policy,
+    }
+    return values, states, N, meta
+
+
+def _state_estimator(values: np.ndarray, *, nan_policy: str) -> np.ndarray:
+    """
+    Estimate one value per state from replicate measurements according to
+    the common NaN policy.
+
+    This helper is used by high-level WH statistics to build the point
+    estimate of the biological landscape. It is intentionally separate from
+    wh_transform(), which preserves replicate columns by default.
+    """
+    nan_policy = _normalize_nan_policy(nan_policy)
+    values = _as_2d_values(values)
+
+    if nan_policy == "nanmean":
+        return _nanmean_rows(values)
+
+    if nan_policy == "propagate":
+        return np.mean(values, axis=1)
+
+    if nan_policy == "error":
+        if np.isnan(values).any():
+            raise ValueError("NaNs found with nan_policy='error'.")
+        return np.mean(values, axis=1)
+
+    raise RuntimeError("Internal error: unreachable nan_policy branch.")
+
+
+
+
+def _disable_bootstrap_without_replicates(
+    R: int,
+    B_uncertainty: int,
+    B_null: int,
+    *,
+    context: str,
+) -> tuple[int, int, bool]:
+    """Disable bootstrap requests when fewer than two replicate columns exist."""
+    skip = R < 2 and (B_uncertainty > 0 or B_null > 0)
+    if skip:
+        warnings.warn(
+            f"{context}: bootstrap procedures require at least two replicate "
+            "columns. Returning point estimates and NaN bootstrap/null "
+            "summaries instead.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return 0, 0, True
+    return B_uncertainty, B_null, False
 
 
 def _draw_multipliers(
@@ -499,102 +560,117 @@ def _lex_index(states):
     powers = 1 << np.arange(N-1, -1, -1)     # [2^(N-1), ..., 1]
     return (states @ powers)
 
+def _is_full_hypercube(states: np.ndarray, N: int) -> bool:
+    """
+    Return True if `states` contains exactly the full {0,1}^N hypercube,
+    with no duplicated states and no missing states.
+
+    The order of the rows does not matter.
+    """
+    states = np.asarray(states, dtype=int)
+
+    if states.ndim != 2 or states.shape[1] != N:
+        return False
+
+    expected = 1 << N
+    if states.shape[0] != expected:
+        return False
+
+    if np.any((states != 0) & (states != 1)):
+        return False
+
+    idx = _lex_index(states)
+
+    return np.unique(idx).size == expected
+
 def _binary_domain(N):
     """All s in {0,1}^N in lex order."""
     # Equivalent to: np.array(list(product([0,1], repeat=N)))
     grid = np.indices((2,) * N).reshape(N, -1).T
     return grid
 
-def _fallback_projection(V, states, N, weights=None):
+def _fallback_projection(V, states, N, weights=None, *, nan_policy: str = "nanmean"):
     """
-    Compute Walsh–Hadamard coefficients by direct projection onto the
-    shifted Walsh basis using only the observed states.
+    Compute Walsh-Hadamard coefficients by empirical projection on the
+    observed state subset.
 
-    This function is used when the full hypercube {0,1}^N is not available
-    (i.e., missing genotypes or NaNs), so the fast Walsh–Hadamard transform
-    (FWHT) cannot be applied.
+    Unlike the exact FWHT, this routine can operate on incomplete landscapes.
+    It preserves replicate columns: if V has shape (M, R), the returned
+    coefficient matrix has shape (2^N, R).
 
-    Instead of an exact orthonormal transform over 2^N states, coefficients
-    are estimated by empirical projection:
+    NaN handling
+    ------------
+    - nan_policy="nanmean": preserve replicate columns and ignore NaNs within
+      each replicate-specific projection. For each coefficient and replicate,
+      the denominator is the number/weight of states that are finite in that
+      replicate. States with all-NaN replicate values are dropped entirely.
+    - nan_policy="propagate": keep NaNs; any NaN entering a replicate-specific
+      projection propagates to that coefficient.
+    - nan_policy="error": raise if any NaN is present.
 
-        f_s = (1 / M) * sum_{x in S_obs} phi_s(x) * F(x)
-
-    where:
-        - S_obs is the set of observed states,
-        - M = |S_obs|,
-        - phi_s(x) is the shifted Walsh basis function,
-        - F(x) are the phenotype values.
-
-    This corresponds to computing Walsh coefficients under the empirical
-    uniform inner product on the observed subset:
-
-        <f, g>_obs = (1 / M) * sum_{x in S_obs} f(x) g(x)
-
-    Important:
-    ----------
-    - When the landscape is incomplete, Walsh basis functions are generally
-      no longer orthogonal under this empirical inner product.
-    - Therefore, this routine performs a projection under the observed
-      measure, not a true orthonormal Walsh transform.
-    - Interaction orders may mix if the sampling of states is structured.
-
-    Parameters
-    ----------
-    V : ndarray, shape (M, R)
-        Phenotype values for M observed states and R replicates.
-        Rows correspond to states; columns correspond to replicates.
-
-    states : ndarray, shape (M, N)
-        Binary genotype matrix in {0,1}.
-        Must align row-wise with V.
-
-    N : int
-        Number of loci (so the full WH domain would have size 2^N).
-
-    Returns
-    -------
-    fs : ndarray, shape (2^N, R)
-        Estimated Walsh coefficients for all modes s in {0,1}^N,
-        ordered lexicographically.
-
-    mask_rows : ndarray, shape (M,)
-        Boolean mask indicating which rows were used
-        (rows with NaNs removed).
-
-    Notes
-    -----
-    - Computational cost is O(M * 2^N).
-    - Suitable for small to moderate N.
-    - For complete landscapes without NaNs, prefer FWHT.
+    Important
+    ---------
+    With incomplete landscapes the Walsh basis is not generally orthogonal
+    under the empirical measure. The result is an empirical projection, not an
+    exact orthonormal Walsh-Hadamard transform.
     """
+    nan_policy = _normalize_nan_policy(nan_policy)
+    V = _as_2d_values(V)
+    states = np.asarray(states, dtype=int)
+
+    if states.ndim != 2 or states.shape[1] != N:
+        raise ValueError("states must have shape (M, N).")
+    if states.shape[0] != V.shape[0]:
+        raise ValueError("values and states must have the same number of rows.")
+
     Z = np.where(states == 1, 1.0, -1.0)
     M, R = V.shape
     K = 1 << N
-    fs = np.zeros((K, R), float)
+    fs = np.full((K, R), np.nan, dtype=float)
 
-    mask_rows = ~np.any(np.isnan(V), axis=1)
+    if nan_policy == "error":
+        if np.isnan(V).any():
+            raise ValueError("NaNs found with nan_policy='error'.")
+        mask_rows = np.ones(M, dtype=bool)
+    elif nan_policy == "propagate":
+        mask_rows = np.ones(M, dtype=bool)
+    elif nan_policy == "nanmean":
+        # Preserve replicate columns. Remove only states that have no finite
+        # measurement in any replicate.
+        mask_rows = np.isfinite(V).any(axis=1)
+    else:
+        raise RuntimeError("Internal error: unreachable nan_policy branch.")
+
     Vc = V[mask_rows, :]
     Zc = Z[mask_rows, :]
 
     if weights is None:
-        wc = np.ones(Zc.shape[0], float)
+        wc = np.ones(Zc.shape[0], dtype=float)
     else:
-        wc = np.asarray(weights)[mask_rows].astype(float)
+        wc = np.asarray(weights, dtype=float)[mask_rows]
         wc = np.clip(wc, 0.0, np.inf)
 
-    sum_w = wc.sum()
-    if sum_w <= 0:
-        raise ValueError("All weights are zero (or negative after clipping).")
+    if wc.size == 0 or wc.sum() <= 0:
+        raise ValueError("No usable states/weights for empirical projection.")
 
     for s_idx in range(K):
-        s_bits = ((s_idx >> np.arange(N-1, -1, -1)) & 1).astype(bool)
+        s_bits = ((s_idx >> np.arange(N - 1, -1, -1)) & 1).astype(bool)
         phi_s = np.prod(Zc[:, s_bits], axis=1) if s_bits.any() else np.ones(Zc.shape[0])
 
-        # weighted projection
-        fs[s_idx, :] = ((wc * phi_s)[:, None] * Vc).sum(axis=0) / sum_w
+        if nan_policy == "nanmean":
+            # Replicate-specific empirical projection over finite states only.
+            finite = np.isfinite(Vc)
+            num = np.nansum((wc * phi_s)[:, None] * Vc, axis=0)
+            den = np.sum(wc[:, None] * finite, axis=0)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                fs[s_idx, :] = num / den
+            fs[s_idx, den <= 0] = np.nan
+        else:
+            # For propagate/error, use the same state set for every replicate.
+            # With propagate, NaNs naturally contaminate the corresponding mode.
+            fs[s_idx, :] = ((wc * phi_s)[:, None] * Vc).sum(axis=0) / wc.sum()
 
     return fs, mask_rows
-
 
 def binary_domain(N: int) -> np.ndarray:
     """
@@ -635,68 +711,146 @@ def decode_mode(self, idx: int):
 #                                                            #
 ##############################################################
 
-def wh_transform(values: np.ndarray, states: np.ndarray, N: int, strategy: str = "auto"):
+def wh_transform(
+    values: np.ndarray,
+    states: np.ndarray,
+    N: int,
+    strategy: str = "auto",
+    *,
+    missing_policy: str = "drop",
+    nan_policy: str = "nanmean",
+    collapse_replicates: bool = False,
+):
     """
-    Unified entry point: choose FWHT (complete, no NaNs) or fallback projection (incomplete/NaNs).
-    values: (M,) or (M,R)
-    states: (M,N) in {0,1}
+    Compute Walsh-Hadamard coefficients using FWHT when possible and empirical
+    projection otherwise.
+
+    Parameters
+    ----------
+    values : ndarray, shape (M,) or (M, R)
+        Phenotype values aligned with `states`. If a matrix is supplied,
+        columns are treated as replicate landscapes.
+    states : ndarray, shape (M, N)
+        Binary states in {0,1}.
+    N : int
+        Number of loci.
+    strategy : {"auto", "fwht", "fallback"}, default="auto"
+        Transform strategy. "fwht" requires a complete hypercube and no NaNs.
+        "fallback" uses empirical projection on the available states.
+    missing_policy : {"error", "drop"}, default="drop"
+        - "error": require a complete 2^N hypercube after NaN handling.
+        - "drop": allow incomplete inputs and use empirical projection.
+    nan_policy : {"nanmean", "propagate", "error"}, default="nanmean"
+        NaN policy for `values`.
+
+        The important convention is that wh_transform preserves replicate
+        columns by default. Thus, with values of shape (M, R), the output has
+        shape (2^N, R) unless collapse_replicates=True.
+
+        - "nanmean": ignore NaNs in replicate-specific empirical projections;
+          for FWHT, any remaining NaN forces fallback in strategy="auto".
+        - "propagate": preserve NaNs so they propagate through the transform.
+        - "error": raise if any NaN is present.
+    collapse_replicates : bool, default=False
+        If False, compute WH coefficients for all replicate columns at once.
+        If True, first estimate one value per state according to nan_policy and
+        return a single coefficient vector.
+
+    Returns
+    -------
+    fs : ndarray
+        WH coefficients. Shape is (2^N, R) for matrix input with
+        collapse_replicates=False; shape is (2^N,) for vector input or collapsed
+        replicate input.
+    s_bits : ndarray, shape (2^N, N)
+        Mode bit vectors.
+    orders : ndarray, shape (2^N,)
+        Hamming weight of each mode.
+    meta : dict
+        Transform metadata.
     """
-    V = np.asarray(values, dtype=float)
+    missing_policy = _normalize_missing_policy(missing_policy)
+    nan_policy = _normalize_nan_policy(nan_policy)
+
+    raw_values = np.asarray(values)
+    input_was_1d = raw_values.ndim == 1
+
+    V = _as_2d_values(values)
     states = np.asarray(states, dtype=int)
 
-    if V.ndim == 1:
-        V = V[:, None]
-        squeeze = True
-    elif V.ndim == 2:
-        squeeze = False
+    if states.ndim != 2 or states.shape[1] != N:
+        raise ValueError("states must have shape (M, N).")
+    if states.shape[0] != V.shape[0]:
+        raise ValueError("values and states must have the same number of rows.")
 
-        # NEW: collapse replicate matrix with partial NaNs to one value per state
-        if np.isnan(V).any():
-            V = np.nanmean(V, axis=1)[:, None]
-            squeeze = True
-    else:
-        raise ValueError("values must be 1D or 2D.")
+    if nan_policy == "error" and np.isnan(V).any():
+        raise ValueError("NaNs found with nan_policy='error'.")
 
-    # NEW: drop only states that are all-NaN after nanmean
-    valid = np.isfinite(V[:, 0])
-    V = V[valid, :]
-    states = states[valid, :]
+    if collapse_replicates:
+        V = _state_estimator(V, nan_policy=nan_policy)[:, None]
 
-    M = V.shape[0]
+    # For nanmean, remove only states that are not usable at all. If replicates
+    # are preserved, a state is usable when at least one replicate is finite.
+    valid = np.ones(V.shape[0], dtype=bool)
+    if nan_policy == "nanmean":
+        valid = np.isfinite(V).any(axis=1)
+        V = V[valid, :]
+        states = states[valid, :]
+
+    complete = _is_full_hypercube(states, N)
+    has_nans = np.isnan(V).any()
+
+    if missing_policy == "error" and not complete:
+        raise ValueError(
+            "missing_policy='error' requires a complete 2^N hypercube after NaN handling."
+        )
+
     meta = {
         "path": None,
         "reordered": False,
         "mask_rows": valid,
-        "collapsed_nan_replicates": bool(np.asarray(values).ndim == 2 and np.isnan(np.asarray(values, dtype=float)).any()),
+        "complete_hypercube": bool(complete),
+        "nan_policy": nan_policy,
+        "missing_policy": missing_policy,
+        "collapse_replicates": bool(collapse_replicates),
     }
 
-    # Decide path
-    complete = (M == (1 << N))
-    has_nans = np.isnan(V).any()
+    if strategy not in {"auto", "fwht", "fallback"}:
+        raise ValueError("strategy must be 'auto', 'fwht', or 'fallback'.")
 
     if strategy == "fwht":
-        if not complete or has_nans:
-            raise ValueError("FWHT requires complete landscape (2^N) and no NaNs.")
+        if not complete:
+            raise ValueError("FWHT requires a complete landscape.")
+        if has_nans:
+            raise ValueError(
+                "FWHT requires no NaNs. Use strategy='fallback', nan_policy='nanmean', "
+                "or collapse_replicates=True if appropriate."
+            )
         V_sorted, reordered = _ensure_lex_and_sort(V, states)
         fs = fwht_shifted(V_sorted, N)
-        meta.update({"path": "fwht", "reordered": reordered, "mask_rows": np.ones(M, bool)})
+        meta.update({"path": "fwht", "reordered": reordered})
+
     elif strategy == "fallback":
-        fs, mask = _fallback_projection(V, states, N)
+        fs, mask = _fallback_projection(V, states, N, nan_policy=nan_policy)
         meta.update({"path": "fallback", "reordered": False, "mask_rows": mask})
-    else:  # "auto"
+
+    else:  # auto
         if complete and not has_nans:
             V_sorted, reordered = _ensure_lex_and_sort(V, states)
             fs = fwht_shifted(V_sorted, N)
-            meta.update({"path": "fwht", "reordered": reordered, "mask_rows": np.ones(M, bool)})
+            meta.update({"path": "fwht", "reordered": reordered})
         else:
-            fs, mask = _fallback_projection(V, states, N)
+            fs, mask = _fallback_projection(V, states, N, nan_policy=nan_policy)
             meta.update({"path": "fallback", "reordered": False, "mask_rows": mask})
 
-    # Build s_bits and orders in lex order
-    s_bits = _binary_domain(N)               # (2^N, N)
-    orders = s_bits.sum(axis=1)              # (2^N,)
+    s_bits = _binary_domain(N)
+    orders = s_bits.sum(axis=1)
 
-    return (fs[:, 0] if squeeze else fs), s_bits, orders, meta
+    fs = np.asarray(fs)
+    if (input_was_1d or collapse_replicates) and fs.ndim == 2 and fs.shape[1] == 1:
+        fs = fs[:, 0]
+
+    return fs, s_bits, orders, meta
 
 
 #############################################################
@@ -709,8 +863,8 @@ def walsh_analysis(
     L: "Landscape",
     *,
     # Robustness options
-    missing_policy: str = "error",     # {"error","drop"} – currently only sanity-checked
-    nan_policy: str = "omit",          # {"omit","propagate"} – forwarded to _clean_landscape_for_wh
+    missing_policy: str = "drop",
+    nan_policy: str = "nanmean",
     # Bootstrap options
     B_uncertainty: int = 0,
     uncertainty_flavor: str = "iid",   # {"iid","wildcluster"}
@@ -733,8 +887,11 @@ def walsh_analysis(
     if rng is None:
         rng = np.random.default_rng()
 
+    missing_policy = _normalize_missing_policy(missing_policy)
+    nan_policy = _normalize_nan_policy(nan_policy)
+
     # ---------- cleaning and basic checks ----------
-    values, states, N = _clean_landscape_for_wh(
+    values, states, N, clean_meta = _clean_landscape_for_wh(
         L,
         missing_policy=missing_policy,
         nan_policy=nan_policy,
@@ -743,39 +900,90 @@ def walsh_analysis(
     if states.shape != (M, N):
         raise ValueError("states and values must have compatible shapes (M,N) and (M,R).")
 
-    if R < 2 and (B_uncertainty > 0 or B_null > 0):
-        raise ValueError("At least 2 replicates are required for bootstrap procedures.")
+    B_uncertainty, B_null, bootstrap_skipped_no_replicates = _disable_bootstrap_without_replicates(
+        R,
+        B_uncertainty,
+        B_null,
+        context="walsh_analysis",
+    )
 
     # ---------- point-estimate WH coefficients ----------
-    Fhat = np.nanmean(values, axis=1)
+    # Main estimator: one value per state according to nan_policy, then WH.
+    Fhat = _state_estimator(values, nan_policy=nan_policy)
 
-    valid = np.isfinite(Fhat)
-    values = values[valid]
-    states = states[valid]
-    Fhat = Fhat[valid]
+    # Under nanmean, states with all-NaN replicates were already removed by the
+    # cleaner. Keep this defensive filter for externally constructed objects.
+    if nan_policy == "nanmean":
+        valid = np.isfinite(Fhat)
+        values = values[valid]
+        states = states[valid]
+        Fhat = Fhat[valid]
 
     fs_hat, s_bits, orders, meta = wh_transform(
-        values=Fhat,
+        values=values,
         states=states,
         N=N,
+        missing_policy=missing_policy,
+        nan_policy=nan_policy,
+        collapse_replicates=True,
     )
 
     fs_hat = np.asarray(fs_hat).ravel()
     K = fs_hat.shape[0]
 
     mean_fs = fs_hat
+
+    # Replicate-level WH coefficients are diagnostic only. The main estimator
+    # remains the state-level estimator above. If replicate-level transforms are
+    # not well-defined, keep SDs as NaN rather than inventing precision.
+    fs_values = fs_hat[:, None]
     std_exp = np.full(K, np.nan)
     std_bio = np.full(K, np.nan)
+    if R > 1:
+        try:
+            fs_rep, _, _, meta_rep = wh_transform(
+                values=values,
+                states=states,
+                N=N,
+                missing_policy=missing_policy,
+                nan_policy=nan_policy,
+                collapse_replicates=False,
+            )
+            fs_rep = np.asarray(fs_rep, dtype=float)
+            if fs_rep.ndim == 1:
+                fs_rep = fs_rep[:, None]
+            if fs_rep.shape[0] == K:
+                fs_values = fs_rep
+                n_valid_modes = np.sum(np.isfinite(fs_rep), axis=1)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    std_exp = np.nanstd(fs_rep, axis=1, ddof=1)
+                    std_bio = std_exp / np.sqrt(n_valid_modes)
+                std_exp[n_valid_modes < 2] = np.nan
+                std_bio[n_valid_modes < 2] = np.nan
+        except Exception:
+            fs_values = fs_hat[:, None]
 
     W = WalshResults(
-        values=fs_hat[:, None],
+        values=fs_values,
         mean=mean_fs,
         std_experimental=std_exp,
         std_biological=std_bio,
         s_bits=s_bits,
         orders=orders,
-        feature_names=list(L.feature_names),
-        meta={"N": N, "missing_policy": missing_policy, "nan_policy": nan_policy, "transform_meta": meta},
+        feature_names=list(getattr(L, "feature_names", [f"x{i}" for i in range(N)])),
+        meta={
+            "N": N,
+            "missing_policy": missing_policy,
+            "nan_policy": nan_policy,
+            "clean_meta": clean_meta,
+            "transform_meta": meta,
+            "replicate_transform_meta": locals().get("meta_rep", None),
+            "mean_estimator": (
+                "WH(state_nanmean)" if nan_policy == "nanmean" else "WH(state_mean)"
+            ),
+            "std_estimator": "replicate_level_WH_when_defined",
+            "bootstrap_skipped_no_replicates": bootstrap_skipped_no_replicates,
+        },
     )
 
     # Early exit if no bootstrap requested
@@ -809,6 +1017,8 @@ def walsh_analysis(
                 values=F_b,
                 states=states,
                 N=N,
+                missing_policy=missing_policy,
+                nan_policy="error",
             )
             fs_b = np.asarray(fs_b)
             if fs_b.ndim > 1 and fs_b.shape[1] == 1:
@@ -864,7 +1074,8 @@ def walsh_analysis(
                 values=F_b,
                 states=states,
                 N=N,
-                strategy="fwht",   # force exact WH; fail if the hypercube is not complete
+                missing_policy=missing_policy,
+                nan_policy="error",
             )
 
             fs_b = np.asarray(fs_b).ravel()
@@ -944,8 +1155,8 @@ def epistasis_amplitude(
     L: "Landscape",
     *,
     # Cleaning policies
-    missing_policy: str = "error",
-    nan_policy: str = "omit",
+    missing_policy: str = "drop",
+    nan_policy: str = "nanmean",
     # Uncertainty bootstrap
     B_uncertainty: int = 0,
     uncertainty_flavor: str = "iid",   # {"iid","wildcluster"}
@@ -978,20 +1189,24 @@ def epistasis_amplitude(
     # -----------------------------
     # 1. Clean landscape and extract data
     # -----------------------------
-    values, states, N = _clean_landscape_for_wh(
+    values, states, N, clean_meta = _clean_landscape_for_wh(
         L,
         missing_policy=missing_policy,
         nan_policy=nan_policy,
     )
     M, R = values.shape
 
-    if R < 2 and (B_uncertainty > 0 or B_null > 0):
-        raise ValueError("At least 2 replicates are required for bootstrap procedures.")
+    B_uncertainty, B_null, bootstrap_skipped_no_replicates = _disable_bootstrap_without_replicates(
+        R,
+        B_uncertainty,
+        B_null,
+        context="epistasis_amplitude",
+    )
 
     # -----------------------------
     # 2. Point estimate: F̂(x)
     # -----------------------------
-    F_hat = np.nanmean(values, axis=1)  # (M,)
+    F_hat = _state_estimator(values, nan_policy=nan_policy)  # (M,)
 
     # -----------------------------
     # 3. Walsh–Hadamard transform of F̂
@@ -1000,6 +1215,8 @@ def epistasis_amplitude(
         values=F_hat,
         states=states,
         N=N,
+        missing_policy=missing_policy,
+        nan_policy="propagate",
     )
     fs_hat = np.asarray(fs_hat).ravel()
 
@@ -1041,11 +1258,27 @@ def epistasis_amplitude(
     # Early exit
     if B_uncertainty <= 0 and B_null <= 0:
         if as_dataframe:
-            return pd.DataFrame({
+            out = pd.DataFrame({
                 "Order": S_unique,
                 "Epistasis amplitude <E^2>_k": U_obs,
             })
-        return {"orders": S_unique, "amplitude": U_obs}
+            if bootstrap_skipped_no_replicates:
+                out["CI low"] = np.nan
+                out["CI high"] = np.nan
+                out["Null CI low"] = np.nan
+                out["Null CI high"] = np.nan
+                out["SNR (null)"] = np.nan
+                out["Null mean"] = np.nan
+                out["Variance (obs)"] = U_obs
+                out["Variance (null median)"] = np.nan
+                out["P-value order"] = np.nan
+                out["P-value var"] = np.nan
+            return out
+        return {
+            "orders": S_unique,
+            "amplitude": U_obs,
+            "bootstrap_skipped_no_replicates": bootstrap_skipped_no_replicates,
+        }
 
     # -----------------------------
     # 5. Prepare DF for bootstrap engines
@@ -1090,7 +1323,7 @@ def epistasis_amplitude(
 
         U_unc_b = np.empty((B_uncertainty, K_ord), dtype=float)
         for b in range(B_uncertainty):
-            fs_b, _, _, _ = wh_transform(values=boots_mat[:, b], states=states, N=N)
+            fs_b, _, _, _ = wh_transform(values=boots_mat[:, b], states=states, N=N, missing_policy=missing_policy, nan_policy="error")
             fs_b = np.asarray(fs_b).ravel()
 
             # NEW: compute amplitude and normalize per bootstrap sample if needed
@@ -1128,7 +1361,7 @@ def epistasis_amplitude(
         U_null_b = np.empty((B_null, K_ord), dtype=float)
 
         for b in range(B_null):
-            fs_b, _, _, _ = wh_transform(values=boots_mat[:, b], states=states, N=N)
+            fs_b, _, _, _ = wh_transform(values=boots_mat[:, b], states=states, N=N, missing_policy=missing_policy, nan_policy="error")
             fs_b = np.asarray(fs_b).ravel()
 
             # compute amplitude and normalize per null sample if needed
@@ -1335,8 +1568,8 @@ def variance_by_order_statistics(
     L: "Landscape",
     *,
     # Cleaning policies
-    missing_policy: str = "error",
-    nan_policy: str = "omit",
+    missing_policy: str = "drop",
+    nan_policy: str = "nanmean",
     # Uncertainty bootstrap (around F̂)
     B_uncertainty: int = 0,
     uncertainty_flavor: str = "iid",  # {"iid","wildcluster"}
@@ -1387,20 +1620,24 @@ def variance_by_order_statistics(
     # -----------------------------
     # 1. Clean landscape and extract data
     # -----------------------------
-    values, states, N = _clean_landscape_for_wh(
+    values, states, N, clean_meta = _clean_landscape_for_wh(
         L,
         missing_policy=missing_policy,
         nan_policy=nan_policy,
     )
     M, R = values.shape
 
-    if R < 2 and (B_uncertainty > 0 or B_null > 0):
-        raise ValueError("At least 2 replicates are required for bootstrap procedures.")
+    B_uncertainty, B_null, bootstrap_skipped_no_replicates = _disable_bootstrap_without_replicates(
+        R,
+        B_uncertainty,
+        B_null,
+        context="variance_by_order_statistics",
+    )
 
     # -----------------------------
     # 2. Point estimate: F̂(x)
     # -----------------------------
-    F_hat = np.nanmean(values, axis=1)  # (M,)
+    F_hat = _state_estimator(values, nan_policy=nan_policy)  # (M,)
 
     # -----------------------------
     # 3. Walsh–Hadamard transform of F̂
@@ -1409,6 +1646,8 @@ def variance_by_order_statistics(
         values=F_hat,
         states=states,
         N=N,
+        missing_policy=missing_policy,
+        nan_policy="propagate",
     )
     fs_hat = np.asarray(fs_hat)
     if fs_hat.ndim > 1 and fs_hat.shape[1] == 1:
@@ -1455,14 +1694,26 @@ def variance_by_order_statistics(
     # Early exit if no bootstrap is requested
     if B_uncertainty <= 0 and B_null <= 0:
         if as_dataframe:
-            return pd.DataFrame({
+            out = pd.DataFrame({
                 "Order": S_arr,
                 quantity_label: Q_obs,
             })
+            if bootstrap_skipped_no_replicates:
+                out["CI low"] = np.nan
+                out["CI high"] = np.nan
+                out["Null CI low"] = np.nan
+                out["Null CI high"] = np.nan
+                out["SNR (null)"] = np.nan
+                out["Variance (obs)"] = Q_obs
+                out["Variance (null median)"] = np.nan
+                out["P-value var"] = np.nan
+                out["P-value order"] = np.nan
+            return out
         return {
             "orders": S_arr,
             "quantity": Q_obs,
             "as_fraction": as_fraction,
+            "bootstrap_skipped_no_replicates": bootstrap_skipped_no_replicates,
         }
 
     # -----------------------------
@@ -1507,7 +1758,7 @@ def variance_by_order_statistics(
 
         for b in range(B_uncertainty):
             F_b = boots_mat[:, b]
-            fs_b, _, _, _ = wh_transform(values=F_b, states=states, N=N)
+            fs_b, _, _, _ = wh_transform(values=F_b, states=states, N=N, missing_policy=missing_policy, nan_policy="error")
             fs_b = np.asarray(fs_b)
             if fs_b.ndim > 1 and fs_b.shape[1] == 1:
                 fs_b = fs_b[:, 0]
@@ -1520,10 +1771,10 @@ def variance_by_order_statistics(
             if as_fraction:
                 tot_b = V_b.sum()
                 if tot_b > 0:
-                    # normalize by the total variance of each bootstrap sample
+                    # normalize by observed total_var to keep statistics comparable
                     Q_b = V_b / tot_b
                 else:
-                    Q_b = np.full_like(V_b, np.nan)
+                    Q_b = np.full_like(V_b, np.nan) # avoid NaNs
             else:
                 Q_b = V_b
 
@@ -1557,8 +1808,8 @@ def variance_by_order_statistics(
             for i in range(R):
                 mask = np.ones(R, dtype=bool)
                 mask[i] = False
-                F_i = np.nanmean(values[:, mask], axis=1)  # leave-one-out mean
-                fs_i, _, _, _ = wh_transform(values=F_i, states=states, N=N)
+                F_i = _state_estimator(values[:, mask], nan_policy=nan_policy)
+                fs_i, _, _, _ = wh_transform(values=F_i, states=states, N=N, missing_policy=missing_policy, nan_policy="propagate")
                 fs_i = np.asarray(fs_i)
                 if fs_i.ndim > 1 and fs_i.shape[1] == 1:
                     fs_i = fs_i[:, 0]
@@ -1641,7 +1892,7 @@ def variance_by_order_statistics(
 
         for b in range(B_null):
             F_b = boots_mat[:, b]
-            fs_b, _, _, _ = wh_transform(values=F_b, states=states, N=N)
+            fs_b, _, _, _ = wh_transform(values=F_b, states=states, N=N, missing_policy=missing_policy, nan_policy="error")
             fs_b = np.asarray(fs_b)
             if fs_b.ndim > 1 and fs_b.shape[1] == 1:
                 fs_b = fs_b[:, 0]
@@ -1653,7 +1904,7 @@ def variance_by_order_statistics(
             if as_fraction:
                 tot_b = V_b.sum()
                 if tot_b > 0:
-                    # normalize by the total variance of each bootstrap sample
+                    # normalize by observed total_var to keep statistics comparable
                     Q_b = V_b / tot_b
                 else:
                     Q_b = np.full_like(V_b, np.nan)
@@ -1755,17 +2006,22 @@ def plot_variance_and_amplitude(
     uncertainty_flavor: str = "iid",
     preserve_residual_corr: bool = False,
     # Variance spectrum options
-    as_fraction: bool = True,          # analyze fraction of variance by default
+    as_fraction: bool = True,
+    # Missing / NaN policies
+    missing_policy: str = "drop",
+    nan_policy: str = "nanmean",
+    # Effective-rank options
+    rank_rtol: float | None = None,
     # RNG
     rng: np.random.Generator | None = None,
     # Plot options
     figsize: tuple[float, float] = (12, 4.5),
     show: bool = True,
     # Extra options
-    show_components: bool = False,     # plot combinatorial C(N,S) and dilution 4^{-S}
-    return_data: bool = False,         # optionally return DataFrames and components
-     # how to build uncertainty CIs
-    ci_method_uncertainty: str = "bca",  # {"percentile","studentized","bca"}
+    show_components: bool = False,
+    return_data: bool = False,
+    # how to build uncertainty CIs
+    ci_method_uncertainty: str = "bca",
 ):
     """
     High-level plotting helper for variance decomposition and epistasis amplitude.
@@ -1830,16 +2086,26 @@ def plot_variance_and_amplitude(
     data : dict (optional)
         Only if return_data=True. See description above.
     """
+    """
+    High-level plotting helper for variance decomposition and epistasis amplitude.
+
+    If show_components=True, the combinatorial panel compares:
+        Total    = C(N, S)
+        Observed = H_eff(S) = rank(Phi_S^Omega)
+
+    where Phi_S^Omega is the WH design matrix restricted to observed states
+    and order-S modes.
+    """
     if rng is None:
         rng = np.random.default_rng()
 
     # ---------------------------------------
-    # 1) Variance by order (left panel)
+    # 1) Variance by order
     # ---------------------------------------
     df_var = variance_by_order_statistics(
         L,
-        missing_policy="error",
-        nan_policy="omit",
+        missing_policy=missing_policy,
+        nan_policy=nan_policy,
         B_uncertainty=B_uncertainty,
         uncertainty_flavor=uncertainty_flavor,
         B_null=B_null,
@@ -1852,7 +2118,6 @@ def plot_variance_and_amplitude(
         ci_method_uncertainty=ci_method_uncertainty,
     )
 
-    # Column 1 after "Order" contains the main quantity (variance or fraction)
     quantity_label = df_var.columns[1]
 
     orders_var = df_var["Order"].values
@@ -1863,12 +2128,12 @@ def plot_variance_and_amplitude(
     Q_null_high = df_var["Null CI high"].values
 
     # ---------------------------------------
-    # 2) Epistasis amplitude (right panel)
+    # 2) Epistasis amplitude
     # ---------------------------------------
     df_amp = epistasis_amplitude(
         L,
-        missing_policy="error",
-        nan_policy="omit",
+        missing_policy=missing_policy,
+        nan_policy=nan_policy,
         B_uncertainty=B_uncertainty,
         uncertainty_flavor=uncertainty_flavor,
         B_null=B_null,
@@ -1890,7 +2155,7 @@ def plot_variance_and_amplitude(
     A_null_mean = df_amp["Null mean"].values
 
     # ---------------------------------------
-    # 3) Create figure and subplots
+    # 3) Create figure and axes
     # ---------------------------------------
     if show_components:
         fig, axes = plt.subplots(1, 4, figsize=figsize, sharex=False)
@@ -1898,12 +2163,12 @@ def plot_variance_and_amplitude(
     else:
         fig, axes = plt.subplots(1, 2, figsize=figsize, sharex=False)
         ax_var, ax_amp = axes
-    
 
-    # ---------- Left: variance by order ----------
+    # ---------------------------------------
+    # A) Variance by order
+    # ---------------------------------------
     ax = ax_var
 
-    # Null band
     ax.fill_between(
         orders_var,
         Q_null_low,
@@ -1912,7 +2177,6 @@ def plot_variance_and_amplitude(
         label="Null CI",
     )
 
-    # Observed + uncertainty error bars
     yerr_low = np.clip(Q_obs - Q_ci_low, a_min=0, a_max=None)
     yerr_high = np.clip(Q_ci_high - Q_obs, a_min=0, a_max=None)
 
@@ -1925,37 +2189,117 @@ def plot_variance_and_amplitude(
         label="Observed",
     )
 
-    ax.set_xlabel(r"$\text{Interaction order } \mathcal{S}$",fontsize=14)
-    if(as_fraction):
-        ax.set_ylabel(r"$\frac{V(\mathcal{S})}{V_{\text{tot}}}$", rotation=0, labelpad=20,fontsize=22)
-        #ax.set_title("Fraction of variance by order")
-    else:
-        ax.set_ylabel(r"$\text{Variance } V(\mathcal{S})$")
-        #ax.set_title("Variance by order")
+    ax.set_xlabel(r"$\text{Interaction order } \mathcal{S}$", fontsize=14)
 
-    # Optionally plot combinatorial C(N,S) and geometric dilution 4^{-S}
+    if as_fraction:
+        ax.set_ylabel(
+            r"$\frac{V(\mathcal{S})}{V_{\text{tot}}}$",
+            rotation=0,
+            labelpad=20,
+            fontsize=22,
+        )
+    else:
+        ax.set_ylabel(r"$\text{Variance } V(\mathcal{S})$", fontsize=14)
+
+    ax.legend(frameon=False)
+
+    # ---------------------------------------
+    # Optional components panels
+    # ---------------------------------------
     components = None
+
     if show_components:
-        # Number of loci
-        N = L.states.shape[1]
         S = orders_var.astype(int)
 
-        # Combinatorial factor and geometric (dilution) factor
-        H = np.array([comb(N, int(s)) for s in S], dtype=float)   # C(N,S)
-        geom = 4.0 ** (-S)                                        # 4^{-S}
+        # Clean states using the same policy as the WH calculations.
+        clean_result = _clean_landscape_for_wh(
+            L,
+            missing_policy=missing_policy,
+            nan_policy=nan_policy,
+        )
 
-        # Normalize both to [0, 1] for visualization on the same axis
-        H_norm = H / H.max() if np.max(H) > 0 else H
-        geom_norm = geom / geom.max() if np.max(geom) > 0 else geom
+        if len(clean_result) == 4:
+            _, states_clean, N, _ = clean_result
+        elif len(clean_result) == 3:
+            _, states_clean, N = clean_result
+        else:
+            raise RuntimeError(
+                "_clean_landscape_for_wh must return either "
+                "(values, states, N) or (values, states, N, meta)."
+            )
+
+        states_clean = np.asarray(states_clean, dtype=int)
+
+        # Full number of formal order-S WH modes.
+        H = np.array([comb(N, int(s)) for s in S], dtype=float)
+
+        # Effective number of observed independent order-S directions:
+        # H_eff(S) = rank(Phi_S^Omega)
+        s_bits_all = _binary_domain(N)
+        orders_all = s_bits_all.sum(axis=1)
+
+        Z = states_to_spins_shifted(states_clean)
+
+        H_eff = np.zeros_like(H, dtype=float)
+
+        for idx, s in enumerate(S):
+            mode_mask = orders_all == int(s)
+            modes_S = s_bits_all[mode_mask]
+
+            if modes_S.size == 0:
+                H_eff[idx] = np.nan
+                continue
+
+            Phi_S = np.empty((states_clean.shape[0], modes_S.shape[0]), dtype=float)
+
+            for j, mode in enumerate(modes_S):
+                active = mode.astype(bool)
+                if np.any(active):
+                    Phi_S[:, j] = np.prod(Z[:, active], axis=1)
+                else:
+                    Phi_S[:, j] = 1.0
+
+            if rank_rtol is None:
+                H_eff[idx] = float(np.linalg.matrix_rank(Phi_S))
+            else:
+                singular_values = np.linalg.svd(Phi_S, compute_uv=False)
+                if singular_values.size == 0:
+                    H_eff[idx] = 0.0
+                else:
+                    tol = float(rank_rtol) * singular_values[0]
+                    H_eff[idx] = float(np.sum(singular_values > tol))
+
+        # B) Combinatorial / observed support panel
+        ax_geo.bar(
+            orders_var,
+            H_eff,
+            alpha=0.45,
+            label="Observed",
+        )
 
         ax_geo.plot(
             orders_var,
-            H_norm,
+            H,
             linestyle="-",
             marker="o",
+            linewidth=2.0,
+            label="Total",
         )
-        ax_geo.set_xlabel(r"$\text{Interaction order }  \mathcal{S}$",fontsize=14)
-        ax_geo.set_ylabel(r"$\text{Combinatorial } C(N,\mathcal{S})$",fontsize=14)
+
+        ax_geo.set_xlabel(
+            r"$\text{Interaction order } \mathcal{S}$",
+            fontsize=14,
+        )
+        ax_geo.set_ylabel(
+            r"$\text{Number of interaction modes}$",
+            fontsize=14,
+        )
+        ax_geo.legend(frameon=False)
+
+        # C) Geometric dilution panel
+        geom = 4.0 ** (-S)
+
+        geom_norm = geom / geom.max() if np.max(geom) > 0 else geom
 
         ax_dil.plot(
             orders_var,
@@ -1963,22 +2307,28 @@ def plot_variance_and_amplitude(
             linestyle="-",
             marker="o",
         )
-        ax_dil.set_xlabel(r"$\text{Interaction order }  \mathcal{S}$",fontsize=14)
-        ax_dil.set_ylabel(r"$\text{Dilution } 4^{-\mathcal{S}}$",fontsize=14)
+
+        ax_dil.set_xlabel(
+            r"$\text{Interaction order } \mathcal{S}$",
+            fontsize=14,
+        )
+        ax_dil.set_ylabel(
+            r"$\text{Dilution } 4^{-\mathcal{S}}$",
+            fontsize=14,
+        )
 
         components = {
             "orders": S,
             "H": H,
+            "H_eff": H_eff,
             "geom": geom,
         }
 
-    #ax.grid(alpha=0.3)
-    ax.legend(frameon=False)
-
-    # ---------- Right: epistasis amplitude ----------
+    # ---------------------------------------
+    # D) Epistasis amplitude
+    # ---------------------------------------
     ax = ax_amp
 
-    # Null band
     ax.fill_between(
         orders_amp,
         A_null_low,
@@ -1991,41 +2341,55 @@ def plot_variance_and_amplitude(
         orders_amp,
         A_null_mean,
         linestyle="--",
-        color="C0",
         label="Null mean",
     )
 
-    # Observed + uncertainty error bars
     yerr_low = np.clip(A_obs - A_ci_low, a_min=0, a_max=None)
-    yerr_high= np.clip(A_ci_high - A_obs, a_min=0, a_max=None)
+    yerr_high = np.clip(A_ci_high - A_obs, a_min=0, a_max=None)
+
     ax.errorbar(
         orders_amp,
         A_obs,
         yerr=[yerr_low, yerr_high],
         fmt="o",
         capsize=4,
-        #label="Observed ± uncertainty CI",
+        color="C0",
     )
 
-    ax.set_xlabel(r"$\text{Interaction order }  \mathcal{S}$",fontsize=14)
-    if(as_fraction):
-        ax.set_ylabel(r"$\frac{⟨\mathcal{E}^2⟩_\mathcal{S}}{V_{\text{tot}}}$",labelpad=30,fontsize=22,rotation=0)
-    else:
-        ax.set_ylabel(r"$\text{Epistasis amplitude } ⟨\mathcal{E}^2⟩_\mathcal{S}$",fontsize=14)
-    #ax.set_title("Epistasis amplitude by order")
-    ax.set_yscale("log")
-    #ax.grid(alpha=0.3)
-    ax_amp.legend(frameon=False,fontsize=14)
+    ax.set_xlabel(
+        r"$\text{Interaction order } \mathcal{S}$",
+        fontsize=14,
+    )
 
-    # --- Panel labels (A, B, C, D) ---
-    if show_components:
-        panel_labels = ["A", "B", "C", "D"]  # var, combinatorial, dilution, amplitude
+    if as_fraction:
+        ax.set_ylabel(
+            r"$\frac{⟨\mathcal{E}^2⟩_\mathcal{S}}{V_{\text{tot}}}$",
+            labelpad=30,
+            fontsize=22,
+            rotation=0,
+        )
     else:
-        panel_labels = ["A", "B"]            # var, amplitude
+        ax.set_ylabel(
+            r"$\text{Epistasis amplitude } ⟨\mathcal{E}^2⟩_\mathcal{S}$",
+            fontsize=14,
+        )
+
+    ax.set_yscale("log")
+    ax.legend(frameon=False, fontsize=14)
+
+    # ---------------------------------------
+    # Panel labels
+    # ---------------------------------------
+    if show_components:
+        panel_labels = ["A", "B", "C", "D"]
+    else:
+        panel_labels = ["A", "B"]
 
     for ax, label in zip(axes, panel_labels):
         ax.text(
-            -0.3, 1.05, label,
+            -0.3,
+            1.05,
+            label,
             transform=ax.transAxes,
             fontsize=16,
             fontweight="bold",
@@ -2038,15 +2402,17 @@ def plot_variance_and_amplitude(
     if show:
         plt.show()
     else:
-        plt.close(fig)   
+        plt.close(fig)
 
     if return_data:
         data = {
             "variance": df_var,
             "amplitude": df_amp,
         }
+
         if components is not None:
             data["components"] = components
+
         return fig, axes, data
 
     return fig, axes

@@ -29,13 +29,15 @@ def __getattr__(name: str) -> Any:
         return import_module(".synlands", __name__)
     if name == "io":
         return import_module(".io", __name__)
+    if name == "mech":
+        return import_module(".mechanistic_models", __name__)
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     
 def __dir__():
     """Expose dynamic submodules and public attributes for IDE autocompletion."""
     return sorted(list(globals().keys()) + [
-        "core", "wh", "epi", "sn", "syn",
+        "core", "wh", "epi", "sn", "syn", "mech",
         # Core
         "Landscape",
         # IO
@@ -51,7 +53,7 @@ def __dir__():
         "residuals_and_covariance",
         "correct_variance_spectrum", "project_noise_var_WH",
         "bootstrap_uncertainty", "bootstrap_null",
-        "correct_batch_effect"
+        "correct_batch_effect",
         # Epistasis (deterministic layer)
         "focal_effect", "epistasis_k", "epistasis_pairs",
         "epistasis_distributions_by_order", "epistasis_symbolic",
@@ -63,7 +65,10 @@ def __dir__():
         "BaseConfig","GaussianRandomConfig", "combine_landscapes",
         "FlatEpistasisConfig",
         #Mechanistic models
-        "gaussian_interaction_matrix", "simulate_lv", "evaluate_exact_F",
+        "gaussian_interaction_matrix", "gaussian_hoi_tensor",
+        "simulate_lv", "simulate_lv_hoi",
+        "evaluate_exact_F", "evaluate_numerical_F_hoi",
+        "build_hoi_lv_landscape",
         "growth_rates","is_lv_stable", "is_lv_feasible",
         #Testing
         "test_gaussian_bootstrap_consistency",
@@ -136,8 +141,12 @@ from .synlands import (
 # --- Mechanistic models -------------------------------------------------------------
 from .mechanistic_models import (
     gaussian_interaction_matrix,
+    gaussian_hoi_tensor,
     simulate_lv,
+    simulate_lv_hoi,
     evaluate_exact_F,
+    evaluate_numerical_F_hoi,
+    build_hoi_lv_landscape,
     growth_rates,
     is_lv_stable, 
     is_lv_feasible,
@@ -149,7 +158,7 @@ from .test import test_gaussian_bootstrap_consistency
 # --- Public namespace -------------------------------------------------------------
 __all__ = [
     # Submodules
-    "core", "wh", "epi", "sn", "syn","io",
+    "core", "wh", "epi", "sn", "syn", "mech","io",
     # Core
     "Landscape",
     #IO
@@ -182,7 +191,10 @@ __all__ = [
     # Synthetic
     "BaseConfig", "GaussianRandomConfig", "combine_landscapes", "FlatEpistasisConfig",
     #Mechanistic models
-    "gaussian_interaction_matrix", "simulate_lv", "evaluate_exact_F",
+    "gaussian_interaction_matrix", "gaussian_hoi_tensor",
+    "simulate_lv", "simulate_lv_hoi",
+    "evaluate_exact_F", "evaluate_numerical_F_hoi",
+    "build_hoi_lv_landscape",
     "growth_rates","is_lv_stable", "is_lv_feasible",
     #Testing
     "test_gaussian_bootstrap_consistency",
